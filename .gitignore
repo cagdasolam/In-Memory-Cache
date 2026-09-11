@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.bk
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment and secrets
+.env
+*.env
+*.env.local
+
+# Logs and runtime dumps (AOF, RDB persistence files)
+*.log
+dump.rdb
+*.aof
+appendonly.aof
+
