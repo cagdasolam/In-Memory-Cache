@@ -3,21 +3,26 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 use crate::cmd::Command;
 use crate::db::Db;
 use crate::frame::{Frame, FrameError};
 
+enum AofMsg {
+    Record(Vec<u8>),
+    Flush(oneshot::Sender<()>),
+}
+
 pub struct Aof {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<AofMsg>,
 }
 
 impl Aof {
     /// Start the background AOF writer task.
     pub fn start(file_path: PathBuf) -> Self {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
+        let (tx, mut rx) = mpsc::channel::<AofMsg>(2048);
 
         tokio::spawn(async move {
             let file = match OpenOptions::new()
@@ -35,15 +40,26 @@ impl Aof {
 
             let mut writer = BufWriter::new(file);
 
-            while let Some(bytes) = rx.recv().await {
-                if let Err(e) = writer.write_all(&bytes).await {
-                    error!("AOF write error: {}", e);
-                    continue;
-                }
-                if let Err(e) = writer.flush().await {
-                    error!("AOF flush error: {}", e);
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    AofMsg::Record(bytes) => {
+                        if let Err(e) = writer.write_all(&bytes).await {
+                            error!("AOF write error: {}", e);
+                            continue;
+                        }
+                    }
+                    AofMsg::Flush(reply) => {
+                        let _ = writer.flush().await;
+                        let _ = writer.get_ref().sync_all().await;
+                        let _ = reply.send(());
+                    }
                 }
             }
+
+            // Drain remaining before shutdown
+            let _ = writer.flush().await;
+            let _ = writer.get_ref().sync_all().await;
+            info!("AOF writer task safely closed: {:?}", file_path);
         });
 
         Aof { tx }
@@ -53,7 +69,15 @@ impl Aof {
     pub async fn record(&self, frame: &Frame) {
         let mut buf = Vec::new();
         frame.write_to_buf(&mut buf);
-        let _ = self.tx.send(buf).await;
+        let _ = self.tx.send(AofMsg::Record(buf)).await;
+    }
+
+    /// Force an immediate flush and OS sync of all pending AOF operations.
+    pub async fn sync(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(AofMsg::Flush(tx)).await.is_ok() {
+            let _ = rx.await;
+        }
     }
 
     /// Load and replay commands from an AOF file to rebuild database state.

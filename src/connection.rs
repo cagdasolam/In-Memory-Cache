@@ -15,10 +15,11 @@ pub struct Connection {
 impl Connection {
     /// Create a new `Connection`, backed by a TCP stream.
     pub fn new(socket: TcpStream) -> Connection {
+        let _ = socket.set_nodelay(true);
         Connection {
             stream: BufWriter::new(socket),
-            // Default 4KB buffer for incoming commands
-            buffer: BytesMut::with_capacity(4 * 1024),
+            // Default 8KB buffer for incoming commands
+            buffer: BytesMut::with_capacity(8 * 1024),
         }
     }
 
@@ -61,13 +62,26 @@ impl Connection {
         }
     }
 
-    /// Write a frame to the connection and flush the write buffer.
-    pub async fn write_frame(&mut self, frame: &Frame) -> io::Result<()> {
+    /// Check if more bytes are present in the read buffer (useful for pipelining batch flush).
+    pub fn has_queued_bytes(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
+    /// Write a frame into the internal write buffer without an immediate flush.
+    pub async fn write_frame_buffered(&mut self, frame: &Frame) -> io::Result<()> {
         let mut buf = Vec::new();
         frame.write_to_buf(&mut buf);
-        self.stream.write_all(&buf).await?;
-        self.stream.flush().await?;
-        Ok(())
+        self.stream.write_all(&buf).await
+    }
+
+    /// Flush the buffered writes directly onto the wire.
+    pub async fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush().await
+    }
+
+    /// Write a frame to the connection and immediately flush.
+    pub async fn write_frame(&mut self, frame: &Frame) -> io::Result<()> {
+        self.write_frame_buffered(frame).await?;
+        self.flush().await
     }
 }
-

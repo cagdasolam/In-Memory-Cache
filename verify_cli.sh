@@ -7,10 +7,14 @@ rm -f appendonly.aof
 
 cargo build
 
-echo "=== Starting Server for Phase 3 Testing ==="
-cargo run &
+echo "=== Starting Server for CLI Testing ==="
+./target/debug/in-memory-cache &
 SERVER_PID=$!
-sleep 2
+
+# Wait for server to become responsive
+while ! redis-cli -p 6379 PING > /dev/null 2>&1; do
+    sleep 0.2
+done
 
 echo ">> Testing Lists (LPUSH, RPUSH, LRANGE, LPOP)"
 redis-cli -p 6379 RPUSH tasks "task1" "task2"
@@ -35,13 +39,16 @@ redis-cli -p 6379 SET aof_test_key "persisted_value_123"
 sleep 1
 
 echo ">> Stopping server to test recovery from AOF..."
-kill $SERVER_PID || true
+kill -SIGINT $SERVER_PID || true
 sleep 1
 
 echo ">> Restarting server (Rehydrating from appendonly.aof)..."
-cargo run &
+./target/debug/in-memory-cache &
 SERVER_PID2=$!
-sleep 2
+
+while ! redis-cli -p 6379 PING > /dev/null 2>&1; do
+    sleep 0.2
+done
 
 echo ">> Querying key after restart:"
 redis-cli -p 6379 GET aof_test_key
@@ -56,7 +63,7 @@ sleep 1
 redis-cli -p 6379 PUBLISH announcements "Welcome to Phase 3 PubSub!"
 
 sleep 1
-kill $SERVER_PID2 || true
+kill -SIGINT $SERVER_PID2 || true
 rm -f appendonly.aof
 
-echo "=== All Phase 3 tests passed successfully! ==="
+echo "=== All CLI tests passed successfully! ==="

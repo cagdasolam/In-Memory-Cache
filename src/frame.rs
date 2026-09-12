@@ -53,20 +53,24 @@ impl Frame {
             return Err(FrameError::Incomplete);
         }
 
-        match get_u8(src)? {
+        match peek_u8(src)? {
             b'+' => {
+                get_u8(src)?;
                 get_line(src)?;
                 Ok(())
             }
             b'-' => {
+                get_u8(src)?;
                 get_line(src)?;
                 Ok(())
             }
             b':' => {
+                get_u8(src)?;
                 let _ = get_decimal(src)?;
                 Ok(())
             }
             b'$' => {
+                get_u8(src)?;
                 if peek_u8(src)? == b'-' {
                     let line = get_line(src)?;
                     if line == b"-1" {
@@ -92,6 +96,7 @@ impl Frame {
                 Ok(())
             }
             b'*' => {
+                get_u8(src)?;
                 let len = get_decimal(src)?;
                 if len < 0 {
                     return Err("negative array length".into());
@@ -101,28 +106,36 @@ impl Frame {
                 }
                 Ok(())
             }
-            other => Err(format!("protocol error; invalid frame type byte `{}`", other as char).into()),
+            _ => {
+                // Inline command support (e.g. PING_INLINE, telnet)
+                let _ = get_line(src)?;
+                Ok(())
+            }
         }
     }
 
     /// Parse a frame from `src`. Assumes `check` succeeded.
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Frame, FrameError> {
-        match get_u8(src)? {
+        match peek_u8(src)? {
             b'+' => {
+                get_u8(src)?;
                 let line = get_line(src)?.to_vec();
                 let string = String::from_utf8(line)?;
                 Ok(Frame::Simple(string))
             }
             b'-' => {
+                get_u8(src)?;
                 let line = get_line(src)?.to_vec();
                 let string = String::from_utf8(line)?;
                 Ok(Frame::Error(string))
             }
             b':' => {
+                get_u8(src)?;
                 let val = get_decimal(src)?;
                 Ok(Frame::Integer(val))
             }
             b'$' => {
+                get_u8(src)?;
                 if peek_u8(src)? == b'-' {
                     let line = get_line(src)?;
                     if line == b"-1" {
@@ -149,6 +162,7 @@ impl Frame {
                 Ok(Frame::Bulk(data))
             }
             b'*' => {
+                get_u8(src)?;
                 let len = get_decimal(src)?;
                 let len = usize::try_from(len)?;
                 let mut out = Vec::with_capacity(len);
@@ -159,7 +173,16 @@ impl Frame {
 
                 Ok(Frame::Array(out))
             }
-            _ => unreachable!(),
+            _ => {
+                // Inline command: split by whitespace
+                let line = get_line(src)?;
+                let s = std::str::from_utf8(line).map_err(|_| "invalid utf8 inline command")?;
+                let parts: Vec<Frame> = s
+                    .split_whitespace()
+                    .map(|p| Frame::Bulk(Bytes::copy_from_slice(p.as_bytes())))
+                    .collect();
+                Ok(Frame::Array(parts))
+            }
         }
     }
 
@@ -357,6 +380,29 @@ mod tests {
         assert_eq!(
             buf,
             b"*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$11\r\nantigravity\r\n"
+        );
+    }
+
+    #[test]
+    fn test_inline_command() {
+        let mut cursor = Cursor::new(&b"PING\r\n"[..]);
+        assert!(Frame::check(&mut cursor).is_ok());
+        cursor.set_position(0);
+        assert_eq!(
+            Frame::parse(&mut cursor).unwrap(),
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))])
+        );
+
+        let mut cursor2 = Cursor::new(&b"SET key val\r\n"[..]);
+        assert!(Frame::check(&mut cursor2).is_ok());
+        cursor2.set_position(0);
+        assert_eq!(
+            Frame::parse(&mut cursor2).unwrap(),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(Bytes::from_static(b"key")),
+                Frame::Bulk(Bytes::from_static(b"val")),
+            ])
         );
     }
 }
