@@ -1,7 +1,12 @@
 use in_memory_cache::{Command, Connection, Db, Frame, Result};
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info};
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,6 +24,22 @@ async fn main() -> Result<()> {
     info!("🚀 In-Memory-Cache server listening on {}", bind_addr);
 
     let db = Db::new();
+
+    // Start background active sweeper task
+    let sweeper_db = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            // Active expiration sampling: sample 20 keys, repeat if >25% are expired
+            for _ in 0..16 {
+                let (sampled, expired) = sweeper_db.purge_expired_step(20);
+                if sampled == 0 || expired * 4 <= sampled {
+                    break;
+                }
+            }
+        }
+    });
 
     loop {
         match listener.accept().await {
@@ -53,4 +74,3 @@ async fn process_connection(socket: TcpStream, peer_addr: SocketAddr, db: Db) ->
     info!("Connection closed cleanly by {}", peer_addr);
     Ok(())
 }
-

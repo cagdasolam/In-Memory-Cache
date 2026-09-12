@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use in_memory_cache::{Command, Connection, Db, Frame};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::sleep;
 
 async fn spawn_test_server() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -105,6 +107,127 @@ async fn test_set_and_get() {
 }
 
 #[tokio::test]
+async fn test_del() {
+    let addr = spawn_test_server().await;
+    let socket = TcpStream::connect(addr).await.unwrap();
+    let mut conn = Connection::new(socket);
+
+    // Set two keys
+    let set1 = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"SET")),
+        Frame::Bulk(Bytes::from_static(b"d1")),
+        Frame::Bulk(Bytes::from_static(b"v1")),
+    ]);
+    conn.write_frame(&set1).await.unwrap();
+    let _ = conn.read_frame().await.unwrap();
+
+    let set2 = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"SET")),
+        Frame::Bulk(Bytes::from_static(b"d2")),
+        Frame::Bulk(Bytes::from_static(b"v2")),
+    ]);
+    conn.write_frame(&set2).await.unwrap();
+    let _ = conn.read_frame().await.unwrap();
+
+    // DEL d1 d2 d3 (d3 doesn't exist) -> returns 2
+    let del = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"DEL")),
+        Frame::Bulk(Bytes::from_static(b"d1")),
+        Frame::Bulk(Bytes::from_static(b"d2")),
+        Frame::Bulk(Bytes::from_static(b"d3")),
+    ]);
+    conn.write_frame(&del).await.unwrap();
+    let res = conn.read_frame().await.unwrap().unwrap();
+    assert_eq!(res, Frame::Integer(2));
+}
+
+#[tokio::test]
+async fn test_set_ex_and_ttl() {
+    let addr = spawn_test_server().await;
+    let socket = TcpStream::connect(addr).await.unwrap();
+    let mut conn = Connection::new(socket);
+
+    // SET temp val EX 2
+    let set_ex = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"SET")),
+        Frame::Bulk(Bytes::from_static(b"temp")),
+        Frame::Bulk(Bytes::from_static(b"val")),
+        Frame::Bulk(Bytes::from_static(b"EX")),
+        Frame::Bulk(Bytes::from_static(b"2")),
+    ]);
+    conn.write_frame(&set_ex).await.unwrap();
+    let res = conn.read_frame().await.unwrap().unwrap();
+    assert_eq!(res, Frame::Simple("OK".to_string()));
+
+    // TTL temp -> should be 1 or 2
+    let ttl_cmd = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"TTL")),
+        Frame::Bulk(Bytes::from_static(b"temp")),
+    ]);
+    conn.write_frame(&ttl_cmd).await.unwrap();
+    let res = conn.read_frame().await.unwrap().unwrap();
+    match res {
+        Frame::Integer(secs) => assert!(secs > 0 && secs <= 2),
+        _ => panic!("Expected integer response for TTL"),
+    }
+}
+
+#[tokio::test]
+async fn test_expire_and_pexpire() {
+    let addr = spawn_test_server().await;
+    let socket = TcpStream::connect(addr).await.unwrap();
+    let mut conn = Connection::new(socket);
+
+    // SET exp_key exp_val
+    let set = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"SET")),
+        Frame::Bulk(Bytes::from_static(b"exp_key")),
+        Frame::Bulk(Bytes::from_static(b"exp_val")),
+    ]);
+    conn.write_frame(&set).await.unwrap();
+    let _ = conn.read_frame().await.unwrap();
+
+    // EXPIRE exp_key 10 -> returns 1
+    let exp = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"EXPIRE")),
+        Frame::Bulk(Bytes::from_static(b"exp_key")),
+        Frame::Bulk(Bytes::from_static(b"10")),
+    ]);
+    conn.write_frame(&exp).await.unwrap();
+    let res = conn.read_frame().await.unwrap().unwrap();
+    assert_eq!(res, Frame::Integer(1));
+
+    // PEXPIRE exp_key 500 (500ms)
+    let pexp = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"PEXPIRE")),
+        Frame::Bulk(Bytes::from_static(b"exp_key")),
+        Frame::Bulk(Bytes::from_static(b"50")),
+    ]);
+    conn.write_frame(&pexp).await.unwrap();
+    let res = conn.read_frame().await.unwrap().unwrap();
+    assert_eq!(res, Frame::Integer(1));
+
+    // Sleep 60ms and check GET exp_key -> should be Null (expired)
+    sleep(Duration::from_millis(60)).await;
+    let get = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"GET")),
+        Frame::Bulk(Bytes::from_static(b"exp_key")),
+    ]);
+    conn.write_frame(&get).await.unwrap();
+    let res = conn.read_frame().await.unwrap().unwrap();
+    assert_eq!(res, Frame::Null);
+
+    // TTL of expired key -> should be -2
+    let ttl = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"TTL")),
+        Frame::Bulk(Bytes::from_static(b"exp_key")),
+    ]);
+    conn.write_frame(&ttl).await.unwrap();
+    let res = conn.read_frame().await.unwrap().unwrap();
+    assert_eq!(res, Frame::Integer(-2));
+}
+
+#[tokio::test]
 async fn test_pipelining() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -122,4 +245,3 @@ async fn test_pipelining() {
     // Expected responses: +PONG\r\n+OK\r\n
     assert_eq!(response_str, "+PONG\r\n+OK\r\n");
 }
-

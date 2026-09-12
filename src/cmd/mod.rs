@@ -1,15 +1,21 @@
+pub mod del;
 pub mod echo;
+pub mod expire;
 pub mod get;
 pub mod ping;
 pub mod set;
+pub mod ttl;
 
 use crate::db::Db;
 use crate::frame::Frame;
 
+pub use del::Del;
 pub use echo::Echo;
+pub use expire::Expire;
 pub use get::Get;
 pub use ping::Ping;
 pub use set::Set;
+pub use ttl::Ttl;
 
 #[derive(Debug)]
 pub enum Command {
@@ -17,6 +23,9 @@ pub enum Command {
     Echo(Echo),
     Get(Get),
     Set(Set),
+    Del(Del),
+    Expire(Expire),
+    Ttl(Ttl),
     /// Handle client handshake command
     Command,
 }
@@ -47,6 +56,11 @@ impl Command {
             "ECHO" => Ok(Command::Echo(Echo::parse_frames(iter)?)),
             "GET" => Ok(Command::Get(Get::parse_frames(iter)?)),
             "SET" => Ok(Command::Set(Set::parse_frames(iter)?)),
+            "DEL" => Ok(Command::Del(Del::parse_frames(iter)?)),
+            "EXPIRE" => Ok(Command::Expire(Expire::parse_expire(iter)?)),
+            "PEXPIRE" => Ok(Command::Expire(Expire::parse_pexpire(iter)?)),
+            "TTL" => Ok(Command::Ttl(Ttl::parse_frames(iter, false)?)),
+            "PTTL" => Ok(Command::Ttl(Ttl::parse_frames(iter, true)?)),
             "COMMAND" => Ok(Command::Command),
             other => Err(format!("ERR unknown command '{}'", other).into()),
         }
@@ -59,8 +73,10 @@ impl Command {
             Command::Echo(echo) => echo.apply(),
             Command::Get(get) => get.apply(db),
             Command::Set(set) => set.apply(db),
+            Command::Del(del) => del.apply(db),
+            Command::Expire(expire) => expire.apply(db),
+            Command::Ttl(ttl) => ttl.apply(db),
             Command::Command => Frame::Array(vec![]),
         }
     }
 }
-
