@@ -39,8 +39,10 @@ pub enum Command {
     Hash(HashCmd),
     SetCmd(SetCmd),
     PubSub(PubSubCmd),
-    /// Handle client handshake command
+    /// Handle client handshake commands
     Command,
+    Info,
+    Client,
 }
 
 impl Command {
@@ -99,6 +101,8 @@ impl Command {
             "SUBSCRIBE" => Ok(Command::PubSub(PubSubCmd::parse_subscribe(iter)?)),
 
             "COMMAND" => Ok(Command::Command),
+            "INFO" => Ok(Command::Info),
+            "CLIENT" => Ok(Command::Client),
             other => Err(format!("ERR unknown command '{}'", other).into()),
         }
     }
@@ -136,6 +140,10 @@ impl Command {
             Command::SetCmd(set_cmd) => set_cmd.apply(db),
             Command::PubSub(_) => Frame::Error("ERR pubsub executed in wrong context".into()),
             Command::Command => Frame::Array(vec![]),
+            Command::Info => Frame::Bulk(bytes::Bytes::from_static(
+                b"# Server\r\nredis_version:7.0.0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\nrole:master\r\nloading:0\r\n",
+            )),
+            Command::Client => Frame::Simple("OK".into()),
         }
     }
 

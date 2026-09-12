@@ -26,3 +26,10 @@ dump.rdb
 *.aof
 appendonly.aof
 
+# Node.js and NestJS artifacts
+node_modules/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
