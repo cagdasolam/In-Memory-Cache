@@ -28,8 +28,9 @@ impl Get {
 
     pub fn apply(self, db: &Db) -> Frame {
         match db.get(&self.key) {
-            Some(value) => Frame::Bulk(value),
-            None => Frame::Null,
+            Ok(Some(value)) => Frame::Bulk(value),
+            Ok(None) => Frame::Null,
+            Err(err) => Frame::Error(err),
         }
     }
 }

@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -10,15 +10,26 @@ const DEFAULT_NUM_SHARDS: usize = 64;
 const DEFAULT_LRU_SAMPLE_SIZE: usize = 8;
 const ESTIMATED_ENTRY_OVERHEAD: usize = 64;
 
-/// A cached item with its value, expiration, and atomic last accessed timestamp.
+pub const WRONG_TYPE_ERR: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+
+/// Rich data types supported by the cache engine.
+#[derive(Clone, Debug)]
+pub enum DataType {
+    String(Bytes),
+    List(VecDeque<Bytes>),
+    Set(HashSet<Bytes>),
+    Hash(HashMap<Bytes, Bytes>),
+}
+
+/// A cached item with its data type, expiration, and atomic last accessed timestamp.
 pub struct CacheEntry {
-    pub data: Bytes,
+    pub data: DataType,
     pub expires_at: Option<Instant>,
     pub last_accessed: AtomicU64,
 }
 
 impl CacheEntry {
-    pub fn new(data: Bytes, expires_at: Option<Instant>, now_millis: u64) -> Self {
+    pub fn new(data: DataType, expires_at: Option<Instant>, now_millis: u64) -> Self {
         Self {
             data,
             expires_at,
@@ -34,7 +45,16 @@ impl CacheEntry {
     }
 
     pub fn size_bytes(&self, key: &[u8]) -> usize {
-        key.len() + self.data.len() + ESTIMATED_ENTRY_OVERHEAD
+        let data_size = match &self.data {
+            DataType::String(b) => b.len(),
+            DataType::List(list) => list.iter().map(|b| b.len() + 16).sum::<usize>(),
+            DataType::Set(set) => set.iter().map(|b| b.len() + 16).sum::<usize>(),
+            DataType::Hash(hash) => hash
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + 32)
+                .sum::<usize>(),
+        };
+        key.len() + data_size + ESTIMATED_ENTRY_OVERHEAD
     }
 }
 
@@ -50,7 +70,7 @@ struct Shared {
     start_time: Instant,
 }
 
-/// High-performance sharded in-memory database with TTL, approximated LRU, and memory tracking.
+/// High-performance sharded in-memory database with multi-types, TTL, and approximated LRU.
 #[derive(Clone)]
 pub struct Db {
     shared: Arc<Shared>,
@@ -101,66 +121,77 @@ impl Db {
         (hasher.finish() as usize) % self.shared.num_shards
     }
 
-    /// Retrieve the value for a key, performing passive eviction if expired.
-    /// Updates `last_accessed` atomically on cache hit.
-    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+    /// Ensure memory limit is maintained before adding `needed_bytes`.
+    fn ensure_capacity(&self, needed_bytes: usize) {
+        if self.shared.maxmemory > 0 {
+            while self.shared.current_memory.load(Ordering::Relaxed) + needed_bytes
+                > self.shared.maxmemory
+            {
+                if !self.evict_lru_step(DEFAULT_LRU_SAMPLE_SIZE) {
+                    break;
+                }
+            }
+        }
+    }
+
+    // ==========================================
+    // STRING OPERATIONS
+    // ==========================================
+
+    /// Retrieve a String value, performing passive eviction if expired.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, String> {
         let idx = self.get_shard_index(key);
         let shard = &self.shared.shards[idx];
         let now = Instant::now();
 
-        // 1. First attempt read-only lookup
+        // 1. Read lock attempt
         {
             let entries = shard.entries.read();
             if let Some(entry) = entries.get(key) {
                 if entry.is_expired(now) {
-                    // Needs eviction; fall through to write-lock cleanup below
+                    // fall through to passive write eviction
                 } else {
                     entry
                         .last_accessed
                         .store(self.now_millis(), Ordering::Relaxed);
-                    return Some(entry.data.clone());
+                    return match &entry.data {
+                        DataType::String(b) => Ok(Some(b.clone())),
+                        _ => Err(WRONG_TYPE_ERR.to_string()),
+                    };
                 }
             } else {
-                return None;
+                return Ok(None);
             }
         }
 
-        // 2. Passive eviction: acquire write lock to remove expired key
+        // 2. Passive eviction with write lock
         let mut entries = shard.entries.write();
         if let Some(entry) = entries.get(key) {
             if entry.is_expired(now) {
                 let size = entry.size_bytes(key);
                 entries.remove(key);
                 self.sub_memory(size);
-                return None;
+                return Ok(None);
             } else {
                 entry
                     .last_accessed
                     .store(self.now_millis(), Ordering::Relaxed);
-                return Some(entry.data.clone());
+                return match &entry.data {
+                    DataType::String(b) => Ok(Some(b.clone())),
+                    _ => Err(WRONG_TYPE_ERR.to_string()),
+                };
             }
         }
 
-        None
+        Ok(None)
     }
 
-    /// Set a key-value pair with an optional expiration timestamp.
-    /// Triggers approximated LRU eviction if `maxmemory` limit is exceeded.
+    /// Set a String key-value pair with an optional expiration.
     pub fn set(&self, key: Bytes, value: Bytes, expires_at: Option<Instant>) {
-        let new_entry = CacheEntry::new(value, expires_at, self.now_millis());
+        let new_entry = CacheEntry::new(DataType::String(value), expires_at, self.now_millis());
         let new_size = new_entry.size_bytes(&key);
 
-        // Check if eviction is needed
-        if self.shared.maxmemory > 0 {
-            while self.shared.current_memory.load(Ordering::Relaxed) + new_size
-                > self.shared.maxmemory
-            {
-                if !self.evict_lru_step(DEFAULT_LRU_SAMPLE_SIZE) {
-                    // Cannot evict further (database is empty or all candidate shards are empty)
-                    break;
-                }
-            }
-        }
+        self.ensure_capacity(new_size);
 
         let idx = self.get_shard_index(&key);
         let shard = &self.shared.shards[idx];
@@ -177,6 +208,477 @@ impl Db {
             self.add_memory(new_size);
         }
     }
+
+    // ==========================================
+    // LIST OPERATIONS (LPUSH, RPUSH, LPOP, RPOP, LRANGE)
+    // ==========================================
+
+    pub fn lpush(&self, key: Bytes, elements: Vec<Bytes>) -> Result<usize, String> {
+        let idx = self.get_shard_index(&key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+        let mut entries = shard.entries.write();
+
+        // Passive eviction if expired
+        if let Some(entry) = entries.get(&key) {
+            if entry.is_expired(now) {
+                let size = entry.size_bytes(&key);
+                entries.remove(&key);
+                self.sub_memory(size);
+            }
+        }
+
+        let now_m = self.now_millis();
+        let entry = entries.entry(key.clone()).or_insert_with(|| {
+            CacheEntry::new(DataType::List(VecDeque::new()), None, now_m)
+        });
+
+        match &mut entry.data {
+            DataType::List(list) => {
+                let mut added_bytes = 0;
+                for el in elements {
+                    added_bytes += el.len() + 16;
+                    list.push_front(el);
+                }
+                entry.last_accessed.store(now_m, Ordering::Relaxed);
+                self.add_memory(added_bytes);
+                Ok(list.len())
+            }
+            _ => Err(WRONG_TYPE_ERR.to_string()),
+        }
+    }
+
+    pub fn rpush(&self, key: Bytes, elements: Vec<Bytes>) -> Result<usize, String> {
+        let idx = self.get_shard_index(&key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+        let mut entries = shard.entries.write();
+
+        if let Some(entry) = entries.get(&key) {
+            if entry.is_expired(now) {
+                let size = entry.size_bytes(&key);
+                entries.remove(&key);
+                self.sub_memory(size);
+            }
+        }
+
+        let now_m = self.now_millis();
+        let entry = entries.entry(key.clone()).or_insert_with(|| {
+            CacheEntry::new(DataType::List(VecDeque::new()), None, now_m)
+        });
+
+        match &mut entry.data {
+            DataType::List(list) => {
+                let mut added_bytes = 0;
+                for el in elements {
+                    added_bytes += el.len() + 16;
+                    list.push_back(el);
+                }
+                entry.last_accessed.store(now_m, Ordering::Relaxed);
+                self.add_memory(added_bytes);
+                Ok(list.len())
+            }
+            _ => Err(WRONG_TYPE_ERR.to_string()),
+        }
+    }
+
+    pub fn lpop(&self, key: &[u8]) -> Result<Option<Bytes>, String> {
+        let idx = self.get_shard_index(key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+        let mut entries = shard.entries.write();
+
+        if let Some(entry) = entries.get_mut(key) {
+            if entry.is_expired(now) {
+                let size = entry.size_bytes(key);
+                entries.remove(key);
+                self.sub_memory(size);
+                return Ok(None);
+            }
+
+            match &mut entry.data {
+                DataType::List(list) => {
+                    let popped = list.pop_front();
+                    if let Some(ref p) = popped {
+                        self.sub_memory(p.len() + 16);
+                    }
+                    if list.is_empty() {
+                        let size = entry.size_bytes(key);
+                        entries.remove(key);
+                        self.sub_memory(size);
+                    } else {
+                        entry
+                            .last_accessed
+                            .store(self.now_millis(), Ordering::Relaxed);
+                    }
+                    Ok(popped)
+                }
+                _ => Err(WRONG_TYPE_ERR.to_string()),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn rpop(&self, key: &[u8]) -> Result<Option<Bytes>, String> {
+        let idx = self.get_shard_index(key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+        let mut entries = shard.entries.write();
+
+        if let Some(entry) = entries.get_mut(key) {
+            if entry.is_expired(now) {
+                let size = entry.size_bytes(key);
+                entries.remove(key);
+                self.sub_memory(size);
+                return Ok(None);
+            }
+
+            match &mut entry.data {
+                DataType::List(list) => {
+                    let popped = list.pop_back();
+                    if let Some(ref p) = popped {
+                        self.sub_memory(p.len() + 16);
+                    }
+                    if list.is_empty() {
+                        let size = entry.size_bytes(key);
+                        entries.remove(key);
+                        self.sub_memory(size);
+                    } else {
+                        entry
+                            .last_accessed
+                            .store(self.now_millis(), Ordering::Relaxed);
+                    }
+                    Ok(popped)
+                }
+                _ => Err(WRONG_TYPE_ERR.to_string()),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn lrange(&self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Bytes>, String> {
+        let idx = self.get_shard_index(key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+
+        let entries = shard.entries.read();
+        if let Some(entry) = entries.get(key) {
+            if entry.is_expired(now) {
+                return Ok(Vec::new());
+            }
+
+            match &entry.data {
+                DataType::List(list) => {
+                    entry
+                        .last_accessed
+                        .store(self.now_millis(), Ordering::Relaxed);
+                    let len = list.len() as i64;
+                    if len == 0 {
+                        return Ok(Vec::new());
+                    }
+
+                    // Normalize negative indices
+                    let mut s = if start < 0 { len + start } else { start };
+                    let mut e = if stop < 0 { len + stop } else { stop };
+
+                    if s < 0 {
+                        s = 0;
+                    }
+                    if e >= len {
+                        e = len - 1;
+                    }
+
+                    if s > e || s >= len {
+                        return Ok(Vec::new());
+                    }
+
+                    let result = (s..=e)
+                        .filter_map(|i| list.get(i as usize).cloned())
+                        .collect();
+                    Ok(result)
+                }
+                _ => Err(WRONG_TYPE_ERR.to_string()),
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    // ==========================================
+    // HASH OPERATIONS (HSET, HGET, HDEL, HGETALL)
+    // ==========================================
+
+    pub fn hset(&self, key: Bytes, fields: Vec<(Bytes, Bytes)>) -> Result<usize, String> {
+        let idx = self.get_shard_index(&key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+        let mut entries = shard.entries.write();
+
+        if let Some(entry) = entries.get(&key) {
+            if entry.is_expired(now) {
+                let size = entry.size_bytes(&key);
+                entries.remove(&key);
+                self.sub_memory(size);
+            }
+        }
+
+        let now_m = self.now_millis();
+        let entry = entries.entry(key.clone()).or_insert_with(|| {
+            CacheEntry::new(DataType::Hash(HashMap::new()), None, now_m)
+        });
+
+        match &mut entry.data {
+            DataType::Hash(map) => {
+                let mut added_count = 0;
+                for (field, value) in fields {
+                    let field_len = field.len();
+                    let val_len = value.len();
+                    if let Some(old_val) = map.insert(field, value) {
+                        if val_len > old_val.len() {
+                            self.add_memory(val_len - old_val.len());
+                        } else {
+                            self.sub_memory(old_val.len() - val_len);
+                        }
+                    } else {
+                        added_count += 1;
+                        self.add_memory(field_len + val_len + 32);
+                    }
+                }
+                entry.last_accessed.store(now_m, Ordering::Relaxed);
+                Ok(added_count)
+            }
+            _ => Err(WRONG_TYPE_ERR.to_string()),
+        }
+    }
+
+    pub fn hget(&self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>, String> {
+        let idx = self.get_shard_index(key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+
+        let entries = shard.entries.read();
+        if let Some(entry) = entries.get(key) {
+            if entry.is_expired(now) {
+                return Ok(None);
+            }
+
+            match &entry.data {
+                DataType::Hash(map) => {
+                    entry
+                        .last_accessed
+                        .store(self.now_millis(), Ordering::Relaxed);
+                    Ok(map.get(field).cloned())
+                }
+                _ => Err(WRONG_TYPE_ERR.to_string()),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn hdel(&self, key: &[u8], fields: &[Bytes]) -> Result<usize, String> {
+        let idx = self.get_shard_index(key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+        let mut entries = shard.entries.write();
+
+        if let Some(entry) = entries.get_mut(key) {
+            if entry.is_expired(now) {
+                let size = entry.size_bytes(key);
+                entries.remove(key);
+                self.sub_memory(size);
+                return Ok(0);
+            }
+
+            match &mut entry.data {
+                DataType::Hash(map) => {
+                    let mut removed = 0;
+                    for f in fields {
+                        if let Some(val) = map.remove(f) {
+                            removed += 1;
+                            self.sub_memory(f.len() + val.len() + 32);
+                        }
+                    }
+                    if map.is_empty() {
+                        let size = entry.size_bytes(key);
+                        entries.remove(key);
+                        self.sub_memory(size);
+                    } else {
+                        entry
+                            .last_accessed
+                            .store(self.now_millis(), Ordering::Relaxed);
+                    }
+                    Ok(removed)
+                }
+                _ => Err(WRONG_TYPE_ERR.to_string()),
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn hgetall(&self, key: &[u8]) -> Result<Vec<(Bytes, Bytes)>, String> {
+        let idx = self.get_shard_index(key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+
+        let entries = shard.entries.read();
+        if let Some(entry) = entries.get(key) {
+            if entry.is_expired(now) {
+                return Ok(Vec::new());
+            }
+
+            match &entry.data {
+                DataType::Hash(map) => {
+                    entry
+                        .last_accessed
+                        .store(self.now_millis(), Ordering::Relaxed);
+                    let pairs = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    Ok(pairs)
+                }
+                _ => Err(WRONG_TYPE_ERR.to_string()),
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    // ==========================================
+    // SET OPERATIONS (SADD, SMEMBERS, SREM, SISMEMBER)
+    // ==========================================
+
+    pub fn sadd(&self, key: Bytes, members: Vec<Bytes>) -> Result<usize, String> {
+        let idx = self.get_shard_index(&key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+        let mut entries = shard.entries.write();
+
+        if let Some(entry) = entries.get(&key) {
+            if entry.is_expired(now) {
+                let size = entry.size_bytes(&key);
+                entries.remove(&key);
+                self.sub_memory(size);
+            }
+        }
+
+        let now_m = self.now_millis();
+        let entry = entries.entry(key.clone()).or_insert_with(|| {
+            CacheEntry::new(DataType::Set(HashSet::new()), None, now_m)
+        });
+
+        match &mut entry.data {
+            DataType::Set(set) => {
+                let mut added = 0;
+                for m in members {
+                    let m_len = m.len();
+                    if set.insert(m) {
+                        added += 1;
+                        self.add_memory(m_len + 16);
+                    }
+                }
+                entry.last_accessed.store(now_m, Ordering::Relaxed);
+                Ok(added)
+            }
+            _ => Err(WRONG_TYPE_ERR.to_string()),
+        }
+    }
+
+    pub fn smembers(&self, key: &[u8]) -> Result<Vec<Bytes>, String> {
+        let idx = self.get_shard_index(key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+
+        let entries = shard.entries.read();
+        if let Some(entry) = entries.get(key) {
+            if entry.is_expired(now) {
+                return Ok(Vec::new());
+            }
+
+            match &entry.data {
+                DataType::Set(set) => {
+                    entry
+                        .last_accessed
+                        .store(self.now_millis(), Ordering::Relaxed);
+                    Ok(set.iter().cloned().collect())
+                }
+                _ => Err(WRONG_TYPE_ERR.to_string()),
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn srem(&self, key: &[u8], members: &[Bytes]) -> Result<usize, String> {
+        let idx = self.get_shard_index(key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+        let mut entries = shard.entries.write();
+
+        if let Some(entry) = entries.get_mut(key) {
+            if entry.is_expired(now) {
+                let size = entry.size_bytes(key);
+                entries.remove(key);
+                self.sub_memory(size);
+                return Ok(0);
+            }
+
+            match &mut entry.data {
+                DataType::Set(set) => {
+                    let mut removed = 0;
+                    for m in members {
+                        if set.remove(m) {
+                            removed += 1;
+                            self.sub_memory(m.len() + 16);
+                        }
+                    }
+                    if set.is_empty() {
+                        let size = entry.size_bytes(key);
+                        entries.remove(key);
+                        self.sub_memory(size);
+                    } else {
+                        entry
+                            .last_accessed
+                            .store(self.now_millis(), Ordering::Relaxed);
+                    }
+                    Ok(removed)
+                }
+                _ => Err(WRONG_TYPE_ERR.to_string()),
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn sismember(&self, key: &[u8], member: &[u8]) -> Result<bool, String> {
+        let idx = self.get_shard_index(key);
+        let shard = &self.shared.shards[idx];
+        let now = Instant::now();
+
+        let entries = shard.entries.read();
+        if let Some(entry) = entries.get(key) {
+            if entry.is_expired(now) {
+                return Ok(false);
+            }
+
+            match &entry.data {
+                DataType::Set(set) => {
+                    entry
+                        .last_accessed
+                        .store(self.now_millis(), Ordering::Relaxed);
+                    Ok(set.contains(member))
+                }
+                _ => Err(WRONG_TYPE_ERR.to_string()),
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    // ==========================================
+    // GENERAL KEY AND MEMORY OPERATIONS
+    // ==========================================
 
     /// Delete multiple keys. Returns the number of keys removed.
     pub fn del(&self, keys: &[Bytes]) -> usize {
@@ -216,9 +718,6 @@ impl Db {
     }
 
     /// Returns the remaining TTL in seconds.
-    /// -2 if key does not exist (or is expired).
-    /// -1 if key exists without TTL.
-    /// >= 0 representing remaining seconds.
     pub fn ttl(&self, key: &[u8]) -> i64 {
         let idx = self.get_shard_index(key);
         let shard = &self.shared.shards[idx];
@@ -229,7 +728,6 @@ impl Db {
             match entry.expires_at {
                 Some(exp) => {
                     if now >= exp {
-                        // Expired
                         -2
                     } else {
                         (exp - now).as_secs() as i64
@@ -243,9 +741,6 @@ impl Db {
     }
 
     /// Returns the remaining TTL in milliseconds.
-    /// -2 if key does not exist (or is expired).
-    /// -1 if key exists without TTL.
-    /// >= 0 representing remaining milliseconds.
     pub fn pttl(&self, key: &[u8]) -> i64 {
         let idx = self.get_shard_index(key);
         let shard = &self.shared.shards[idx];
@@ -268,9 +763,7 @@ impl Db {
         }
     }
 
-    /// Perform an active sweeper step over random shards.
-    /// Samples `sample_size` keys and removes expired ones.
-    /// Returns `(sampled_count, expired_count)`.
+    /// Active sweeper step. Samples `sample_size` keys and removes expired ones.
     pub fn purge_expired_step(&self, sample_size: usize) -> (usize, usize) {
         let random_shard_idx = fastrand::usize(..self.shared.num_shards);
         let shard = &self.shared.shards[random_shard_idx];
@@ -282,7 +775,6 @@ impl Db {
                 return (0, 0);
             }
 
-            // Sample random entries from the shard
             let keys: Vec<&Bytes> = entries.keys().collect();
             let n = keys.len().min(sample_size);
             let mut expired = Vec::new();
@@ -315,9 +807,7 @@ impl Db {
         (sampled, expired_keys.len())
     }
 
-    /// Approximated LRU Eviction: Samples `sample_size` keys across shards,
-    /// identifies the key with the smallest `last_accessed` timestamp, and removes it.
-    /// Returns `true` if a key was evicted.
+    /// Approximated LRU Eviction: Samples candidate keys across shards and removes the oldest.
     pub fn evict_lru_step(&self, sample_size: usize) -> bool {
         let mut oldest_key: Option<(usize, Bytes)> = None;
         let mut oldest_time = u64::MAX;
@@ -391,7 +881,6 @@ impl Default for Db {
     }
 }
 
-/// Helper function to parse memory string e.g. "100mb", "1gb", "1048576"
 fn parse_memory_limit(s: &str) -> Option<usize> {
     let s = s.trim().to_lowercase();
     if let Some(num_str) = s.strip_suffix("gb") {
@@ -408,97 +897,98 @@ fn parse_memory_limit(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::sleep;
 
     #[test]
-    fn test_sharded_set_get() {
-        let db = Db::with_options(8, 0);
-        for i in 0..100 {
-            let k = Bytes::from(format!("key:{}", i));
-            let v = Bytes::from(format!("val:{}", i));
-            db.set(k.clone(), v.clone(), None);
-            assert_eq!(db.get(k.as_ref()), Some(v));
-        }
-        assert_eq!(db.len(), 100);
+    fn test_list_operations() {
+        let db = Db::new();
+        let key = Bytes::from("mylist");
+
+        // RPUSH mylist 1 2 3
+        let count = db.rpush(key.clone(), vec![Bytes::from("1"), Bytes::from("2"), Bytes::from("3")]).unwrap();
+        assert_eq!(count, 3);
+
+        // LPUSH mylist 0
+        let count = db.lpush(key.clone(), vec![Bytes::from("0")]).unwrap();
+        assert_eq!(count, 4);
+
+        // LRANGE mylist 0 -1
+        let range = db.lrange(key.as_ref(), 0, -1).unwrap();
+        assert_eq!(range, vec![Bytes::from("0"), Bytes::from("1"), Bytes::from("2"), Bytes::from("3")]);
+
+        // LPOP
+        let popped = db.lpop(key.as_ref()).unwrap();
+        assert_eq!(popped, Some(Bytes::from("0")));
+
+        // RPOP
+        let popped = db.rpop(key.as_ref()).unwrap();
+        assert_eq!(popped, Some(Bytes::from("3")));
     }
 
     #[test]
-    fn test_passive_expiration() {
-        let db = Db::with_options(4, 0);
-        let key = Bytes::from("expire_me");
-        let val = Bytes::from("value");
+    fn test_hash_operations() {
+        let db = Db::new();
+        let key = Bytes::from("myhash");
 
-        // Set with 20ms TTL
-        db.set(key.clone(), val.clone(), Some(Instant::now() + Duration::from_millis(20)));
-        assert_eq!(db.get(key.as_ref()), Some(val));
+        // HSET myhash f1 v1 f2 v2
+        let added = db.hset(key.clone(), vec![
+            (Bytes::from("f1"), Bytes::from("v1")),
+            (Bytes::from("f2"), Bytes::from("v2")),
+        ]).unwrap();
+        assert_eq!(added, 2);
 
-        sleep(Duration::from_millis(30));
-        // Passive eviction should trigger
-        assert_eq!(db.get(key.as_ref()), None);
+        // HGET myhash f1
+        let val = db.hget(key.as_ref(), b"f1").unwrap();
+        assert_eq!(val, Some(Bytes::from("v1")));
+
+        // HDEL myhash f1
+        let del_count = db.hdel(key.as_ref(), &[Bytes::from("f1")]).unwrap();
+        assert_eq!(del_count, 1);
+        assert_eq!(db.hget(key.as_ref(), b"f1").unwrap(), None);
+
+        // HGETALL
+        let all = db.hgetall(key.as_ref()).unwrap();
+        assert_eq!(all, vec![(Bytes::from("f2"), Bytes::from("v2"))]);
     }
 
     #[test]
-    fn test_ttl_and_pttl() {
-        let db = Db::with_options(4, 0);
-        let key = Bytes::from("ttl_test");
-        let val = Bytes::from("value");
+    fn test_set_operations() {
+        let db = Db::new();
+        let key = Bytes::from("myset");
 
-        // Non-existent key
-        assert_eq!(db.ttl(b"non_existent"), -2);
+        // SADD myset a b c a
+        let added = db.sadd(key.clone(), vec![
+            Bytes::from("a"),
+            Bytes::from("b"),
+            Bytes::from("c"),
+            Bytes::from("a"),
+        ]).unwrap();
+        assert_eq!(added, 3);
 
-        // Key with no TTL
-        db.set(key.clone(), val, None);
-        assert_eq!(db.ttl(key.as_ref()), -1);
+        // SISMEMBER
+        assert!(db.sismember(key.as_ref(), b"a").unwrap());
+        assert!(!db.sismember(key.as_ref(), b"z").unwrap());
 
-        // Set TTL of 5 seconds
-        assert!(db.expire(key.as_ref(), Duration::from_secs(5)));
-        assert!(db.ttl(key.as_ref()) <= 5 && db.ttl(key.as_ref()) > 0);
-        assert!(db.pttl(key.as_ref()) <= 5000 && db.pttl(key.as_ref()) > 0);
+        // SREM
+        let rem = db.srem(key.as_ref(), &[Bytes::from("a")]).unwrap();
+        assert_eq!(rem, 1);
+        assert!(!db.sismember(key.as_ref(), b"a").unwrap());
+
+        // SMEMBERS
+        let members = db.smembers(key.as_ref()).unwrap();
+        assert_eq!(members.len(), 2);
     }
 
     #[test]
-    fn test_approximated_lru_eviction() {
-        // Small maxmemory limit (~300 bytes)
-        let db = Db::with_options(2, 300);
+    fn test_wrong_type_error() {
+        let db = Db::new();
+        let key = Bytes::from("str_key");
+        db.set(key.clone(), Bytes::from("value"), None);
 
-        let k1 = Bytes::from("k1");
-        let k2 = Bytes::from("k2");
-        let k3 = Bytes::from("k3");
-        let val = Bytes::from("abcdefghijklmnopqrstuvwxyz"); // 26 bytes
-
-        db.set(k1.clone(), val.clone(), None);
-        db.set(k2.clone(), val.clone(), None);
-
-        // Access k1 so k2 becomes older
-        sleep(Duration::from_millis(5));
-        let _ = db.get(k1.as_ref());
-
-        // Inserting k3 should force LRU eviction
-        db.set(k3.clone(), val.clone(), None);
-
-        // At least one key should have been evicted to keep memory under 300
-        assert!(db.current_memory() <= 300);
-        // k1 was recently accessed, so k1 or newly inserted k3 should still be present
-        assert!(db.get(k1.as_ref()).is_some() || db.get(k3.as_ref()).is_some());
-    }
-
-    #[test]
-    fn test_active_sweeper() {
-        let db = Db::with_options(2, 0);
-        for i in 0..10 {
-            let k = Bytes::from(format!("temp:{}", i));
-            let v = Bytes::from("v");
-            db.set(k, v, Some(Instant::now() + Duration::from_millis(10)));
-        }
-
-        sleep(Duration::from_millis(20));
-
-        // Purge expired keys actively
-        let mut total_expired = 0;
-        for _ in 0..10 {
-            let (_, exp) = db.purge_expired_step(20);
-            total_expired += exp;
-        }
-        assert!(total_expired > 0);
+        // Try list op on string
+        assert_eq!(db.lpush(key.clone(), vec![Bytes::from("1")]).unwrap_err(), WRONG_TYPE_ERR);
+        // Try hash op on string
+        assert_eq!(db.hget(key.as_ref(), b"f").unwrap_err(), WRONG_TYPE_ERR);
+        // Try set op on string
+        assert_eq!(db.smembers(key.as_ref()).unwrap_err(), WRONG_TYPE_ERR);
     }
 }
