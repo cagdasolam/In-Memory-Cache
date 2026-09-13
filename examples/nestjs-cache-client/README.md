@@ -39,6 +39,13 @@ npm run start:dev
 
 NestJS uygulaması `http://localhost:3000` üzerinde açılacaktır.
 
+### 3. Swagger OpenAPI Dokümantasyonuna Erişin
+Tarayıcınızda interaktif Swagger UI arayüzünü açın:
+```text
+http://localhost:3000/api
+```
+Buradan tüm Key-Value, Hash, List, Set ve Pub/Sub uç noktalarını şemalarıyla inceleyebilir ve doğrudan "Try it out" butonuyla test edebilirsiniz.
+
 ---
 
 ## 📖 Kendi Servislerinizde Nasıl Kullanırsınız?
