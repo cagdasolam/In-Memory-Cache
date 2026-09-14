@@ -32,6 +32,12 @@ redis-cli -p 6379 SADD skills "rust" "distributed-systems" "tokio"
 redis-cli -p 6379 SISMEMBER skills "rust"
 redis-cli -p 6379 SMEMBERS skills
 
+echo ">> Testing KEYS and SCAN"
+redis-cli -p 6379 KEYS "*"
+redis-cli -p 6379 KEYS "profile:*"
+redis-cli -p 6379 SCAN 0
+redis-cli -p 6379 SCAN 0 MATCH "task*" COUNT 5
+
 echo ">> Testing AOF Persistence: writing a durable key"
 redis-cli -p 6379 SET aof_test_key "persisted_value_123"
 

@@ -3,9 +3,11 @@ pub mod echo;
 pub mod expire;
 pub mod get;
 pub mod hash;
+pub mod keys;
 pub mod list;
 pub mod ping;
 pub mod pubsub;
+pub mod scan;
 pub mod set;
 pub mod set_cmd;
 pub mod ttl;
@@ -19,9 +21,11 @@ pub use echo::Echo;
 pub use expire::Expire;
 pub use get::Get;
 pub use hash::HashCmd;
+pub use keys::Keys;
 pub use list::ListCmd;
 pub use ping::Ping;
 pub use pubsub::PubSubCmd;
+pub use scan::Scan;
 pub use set::Set;
 pub use set_cmd::SetCmd;
 pub use ttl::Ttl;
@@ -39,6 +43,8 @@ pub enum Command {
     Hash(HashCmd),
     SetCmd(SetCmd),
     PubSub(PubSubCmd),
+    Keys(Keys),
+    Scan(Scan),
     /// Handle client handshake commands
     Command,
     Info,
@@ -59,9 +65,8 @@ impl Command {
             .ok_or_else(|| crate::Error::from("protocol error; empty command array"))?;
 
         let cmd_name = match cmd_frame {
-            Frame::Bulk(bytes) => {
-                String::from_utf8(bytes.to_vec()).map_err(|_| "protocol error; invalid command name")?
-            }
+            Frame::Bulk(bytes) => String::from_utf8(bytes.to_vec())
+                .map_err(|_| "protocol error; invalid command name")?,
             Frame::Simple(s) => s,
             _ => return Err("protocol error; command name must be a string".into()),
         };
@@ -99,6 +104,10 @@ impl Command {
             // Pub/Sub commands
             "PUBLISH" => Ok(Command::PubSub(PubSubCmd::parse_publish(iter)?)),
             "SUBSCRIBE" => Ok(Command::PubSub(PubSubCmd::parse_subscribe(iter)?)),
+
+            // Key inspection and iteration commands
+            "KEYS" => Ok(Command::Keys(Keys::parse_frames(iter)?)),
+            "SCAN" => Ok(Command::Scan(Scan::parse_frames(iter)?)),
 
             "COMMAND" => Ok(Command::Command),
             "INFO" => Ok(Command::Info),
@@ -139,6 +148,8 @@ impl Command {
             Command::Hash(hash) => hash.apply(db),
             Command::SetCmd(set_cmd) => set_cmd.apply(db),
             Command::PubSub(_) => Frame::Error("ERR pubsub executed in wrong context".into()),
+            Command::Keys(keys) => keys.apply(db),
+            Command::Scan(scan) => scan.apply(db),
             Command::Command => Frame::Array(vec![]),
             Command::Info => Frame::Bulk(bytes::Bytes::from_static(
                 b"# Server\r\nredis_version:7.0.0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\nrole:master\r\nloading:0\r\n",

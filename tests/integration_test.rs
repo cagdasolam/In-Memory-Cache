@@ -133,7 +133,10 @@ async fn test_set_and_get() {
         Frame::Bulk(Bytes::from_static(b"bar")),
     ]);
     conn.write_frame(&set_frame).await.unwrap();
-    assert_eq!(conn.read_frame().await.unwrap().unwrap(), Frame::Simple("OK".to_string()));
+    assert_eq!(
+        conn.read_frame().await.unwrap().unwrap(),
+        Frame::Simple("OK".to_string())
+    );
 
     // Get key
     let get_frame = Frame::Array(vec![
@@ -141,7 +144,10 @@ async fn test_set_and_get() {
         Frame::Bulk(Bytes::from_static(b"foo")),
     ]);
     conn.write_frame(&get_frame).await.unwrap();
-    assert_eq!(conn.read_frame().await.unwrap().unwrap(), Frame::Bulk(Bytes::from_static(b"bar")));
+    assert_eq!(
+        conn.read_frame().await.unwrap().unwrap(),
+        Frame::Bulk(Bytes::from_static(b"bar"))
+    );
 }
 
 #[tokio::test]
@@ -181,7 +187,10 @@ async fn test_set_ex_and_ttl() {
         Frame::Bulk(Bytes::from_static(b"2")),
     ]);
     conn.write_frame(&set_ex).await.unwrap();
-    assert_eq!(conn.read_frame().await.unwrap().unwrap(), Frame::Simple("OK".to_string()));
+    assert_eq!(
+        conn.read_frame().await.unwrap().unwrap(),
+        Frame::Simple("OK".to_string())
+    );
 
     // TTL temp
     let ttl_cmd = Frame::Array(vec![
@@ -245,7 +254,10 @@ async fn test_expire_and_pexpire() {
         Frame::Bulk(Bytes::from_static(b"exp_key")),
     ]);
     conn.write_frame(&ttl).await.unwrap();
-    assert_eq!(conn.read_frame().await.unwrap().unwrap(), Frame::Integer(-2));
+    assert_eq!(
+        conn.read_frame().await.unwrap().unwrap(),
+        Frame::Integer(-2)
+    );
 }
 
 #[tokio::test]
@@ -327,7 +339,10 @@ async fn test_list_commands() {
         Frame::Bulk(Bytes::from_static(b"mylist")),
     ]);
     conn.write_frame(&lpop).await.unwrap();
-    assert_eq!(conn.read_frame().await.unwrap().unwrap(), Frame::Bulk(Bytes::from_static(b"hello")));
+    assert_eq!(
+        conn.read_frame().await.unwrap().unwrap(),
+        Frame::Bulk(Bytes::from_static(b"hello"))
+    );
 }
 
 #[tokio::test]
@@ -355,7 +370,10 @@ async fn test_hash_commands() {
         Frame::Bulk(Bytes::from_static(b"name")),
     ]);
     conn.write_frame(&hget).await.unwrap();
-    assert_eq!(conn.read_frame().await.unwrap().unwrap(), Frame::Bulk(Bytes::from_static(b"cagdas")));
+    assert_eq!(
+        conn.read_frame().await.unwrap().unwrap(),
+        Frame::Bulk(Bytes::from_static(b"cagdas"))
+    );
 
     // HDEL user:1 role
     let hdel = Frame::Array(vec![
@@ -436,7 +454,10 @@ async fn test_pubsub() {
         Frame::Bulk(Bytes::from_static(b"Rust 2026 Released")),
     ]);
     pub_conn.write_frame(&pub_cmd).await.unwrap();
-    assert_eq!(pub_conn.read_frame().await.unwrap().unwrap(), Frame::Integer(1));
+    assert_eq!(
+        pub_conn.read_frame().await.unwrap().unwrap(),
+        Frame::Integer(1)
+    );
 
     // Subscriber receives the message
     let msg_frame = sub_conn.read_frame().await.unwrap().unwrap();
@@ -485,4 +506,132 @@ async fn test_aof_recovery() {
     );
 
     let _ = tokio::fs::remove_file(tmp_file).await;
+}
+
+#[tokio::test]
+async fn test_keys_command() {
+    let addr = spawn_test_server().await;
+    let socket = TcpStream::connect(addr).await.unwrap();
+    let mut conn = Connection::new(socket);
+
+    // Populate keys
+    for (k, v) in &[
+        ("user:101", "Alice"),
+        ("user:102", "Bob"),
+        ("order:501", "Widget"),
+    ] {
+        let set_frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Bulk(Bytes::from(*k)),
+            Frame::Bulk(Bytes::from(*v)),
+        ]);
+        conn.write_frame(&set_frame).await.unwrap();
+        assert_eq!(
+            conn.read_frame().await.unwrap().unwrap(),
+            Frame::Simple("OK".to_string())
+        );
+    }
+
+    // KEYS *
+    let keys_all = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"KEYS")),
+        Frame::Bulk(Bytes::from_static(b"*")),
+    ]);
+    conn.write_frame(&keys_all).await.unwrap();
+    let resp = conn.read_frame().await.unwrap().unwrap();
+    if let Frame::Array(arr) = resp {
+        assert_eq!(arr.len(), 3);
+    } else {
+        panic!("expected array response for KEYS *");
+    }
+
+    // KEYS user:*
+    let keys_user = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"KEYS")),
+        Frame::Bulk(Bytes::from_static(b"user:*")),
+    ]);
+    conn.write_frame(&keys_user).await.unwrap();
+    let resp = conn.read_frame().await.unwrap().unwrap();
+    if let Frame::Array(arr) = resp {
+        assert_eq!(arr.len(), 2);
+    } else {
+        panic!("expected array response for KEYS user:*");
+    }
+
+    // KEYS nonexistent:*
+    let keys_none = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"KEYS")),
+        Frame::Bulk(Bytes::from_static(b"nonexistent:*")),
+    ]);
+    conn.write_frame(&keys_none).await.unwrap();
+    let resp = conn.read_frame().await.unwrap().unwrap();
+    if let Frame::Array(arr) = resp {
+        assert_eq!(arr.len(), 0);
+    } else {
+        panic!("expected empty array response");
+    }
+}
+
+#[tokio::test]
+async fn test_scan_command() {
+    let addr = spawn_test_server().await;
+    let socket = TcpStream::connect(addr).await.unwrap();
+    let mut conn = Connection::new(socket);
+
+    // Populate keys
+    for i in 0..15 {
+        let set_frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Bulk(Bytes::from(format!("item:{}", i))),
+            Frame::Bulk(Bytes::from(format!("val:{}", i))),
+        ]);
+        conn.write_frame(&set_frame).await.unwrap();
+        let _ = conn.read_frame().await.unwrap();
+    }
+
+    // SCAN 0 COUNT 100
+    let scan_frame = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"SCAN")),
+        Frame::Bulk(Bytes::from_static(b"0")),
+        Frame::Bulk(Bytes::from_static(b"COUNT")),
+        Frame::Bulk(Bytes::from_static(b"100")),
+    ]);
+    conn.write_frame(&scan_frame).await.unwrap();
+    let resp = conn.read_frame().await.unwrap().unwrap();
+
+    if let Frame::Array(parts) = resp {
+        assert_eq!(parts.len(), 2);
+        // cursor should be "0" since all 15 were scanned in 100 limit
+        assert_eq!(parts[0], Frame::Bulk(Bytes::from_static(b"0")));
+        if let Frame::Array(keys) = &parts[1] {
+            assert_eq!(keys.len(), 15);
+        } else {
+            panic!("expected array of keys in scan result");
+        }
+    } else {
+        panic!("expected 2-element array for SCAN");
+    }
+
+    // SCAN 0 MATCH item:1*
+    let scan_match = Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"SCAN")),
+        Frame::Bulk(Bytes::from_static(b"0")),
+        Frame::Bulk(Bytes::from_static(b"MATCH")),
+        Frame::Bulk(Bytes::from_static(b"item:1*")),
+        Frame::Bulk(Bytes::from_static(b"COUNT")),
+        Frame::Bulk(Bytes::from_static(b"100")),
+    ]);
+    conn.write_frame(&scan_match).await.unwrap();
+    let resp = conn.read_frame().await.unwrap().unwrap();
+
+    if let Frame::Array(parts) = resp {
+        if let Frame::Array(keys) = &parts[1] {
+            // item:1, item:10, item:11, item:12, item:13, item:14 -> 6 items
+            assert_eq!(keys.len(), 6);
+        } else {
+            panic!("expected array of keys");
+        }
+    } else {
+        panic!("expected 2-element array for SCAN");
+    }
 }

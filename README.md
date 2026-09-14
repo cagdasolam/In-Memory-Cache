@@ -173,6 +173,8 @@ PORT=6380 MAXMEMORY=512mb MAX_CONNECTIONS=5000 cargo run --release
 | `PEXPIRE`| `PEXPIRE key milliseconds` | Sets TTL in milliseconds |
 | `TTL` | `TTL key` | Gets remaining TTL in seconds (`-1` no TTL, `-2` not found) |
 | `PTTL` | `PTTL key` | Gets remaining TTL in milliseconds |
+| `KEYS` | `KEYS pattern` | Finds all keys matching the glob pattern (e.g. `KEYS *`, `KEYS user:*`) |
+| `SCAN` | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` | Incrementally iterates keys using a cursor |
 
 ### Hashes
 | Command | Syntax | Description |

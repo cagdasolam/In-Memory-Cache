@@ -10,7 +10,8 @@ const DEFAULT_NUM_SHARDS: usize = 64;
 const DEFAULT_LRU_SAMPLE_SIZE: usize = 8;
 const ESTIMATED_ENTRY_OVERHEAD: usize = 64;
 
-pub const WRONG_TYPE_ERR: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+pub const WRONG_TYPE_ERR: &str =
+    "WRONGTYPE Operation against a key holding the wrong kind of value";
 
 /// Rich data types supported by the cache engine.
 #[derive(Clone, Debug)]
@@ -229,9 +230,9 @@ impl Db {
         }
 
         let now_m = self.now_millis();
-        let entry = entries.entry(key.clone()).or_insert_with(|| {
-            CacheEntry::new(DataType::List(VecDeque::new()), None, now_m)
-        });
+        let entry = entries
+            .entry(key.clone())
+            .or_insert_with(|| CacheEntry::new(DataType::List(VecDeque::new()), None, now_m));
 
         match &mut entry.data {
             DataType::List(list) => {
@@ -263,9 +264,9 @@ impl Db {
         }
 
         let now_m = self.now_millis();
-        let entry = entries.entry(key.clone()).or_insert_with(|| {
-            CacheEntry::new(DataType::List(VecDeque::new()), None, now_m)
-        });
+        let entry = entries
+            .entry(key.clone())
+            .or_insert_with(|| CacheEntry::new(DataType::List(VecDeque::new()), None, now_m));
 
         match &mut entry.data {
             DataType::List(list) => {
@@ -425,9 +426,9 @@ impl Db {
         }
 
         let now_m = self.now_millis();
-        let entry = entries.entry(key.clone()).or_insert_with(|| {
-            CacheEntry::new(DataType::Hash(HashMap::new()), None, now_m)
-        });
+        let entry = entries
+            .entry(key.clone())
+            .or_insert_with(|| CacheEntry::new(DataType::Hash(HashMap::new()), None, now_m));
 
         match &mut entry.data {
             DataType::Hash(map) => {
@@ -564,9 +565,9 @@ impl Db {
         }
 
         let now_m = self.now_millis();
-        let entry = entries.entry(key.clone()).or_insert_with(|| {
-            CacheEntry::new(DataType::Set(HashSet::new()), None, now_m)
-        });
+        let entry = entries
+            .entry(key.clone())
+            .or_insert_with(|| CacheEntry::new(DataType::Set(HashSet::new()), None, now_m));
 
         match &mut entry.data {
             DataType::Set(set) => {
@@ -864,15 +865,213 @@ impl Db {
         self.shared.current_memory.load(Ordering::Relaxed)
     }
 
+    /// Returns all keys matching the glob pattern. Expired keys are excluded.
+    pub fn keys(&self, pattern: &[u8]) -> Vec<Bytes> {
+        let now = Instant::now();
+        let match_all = pattern == b"*";
+        let mut result = Vec::new();
+
+        for shard in &self.shared.shards {
+            let entries = shard.entries.read();
+            for (key, entry) in entries.iter() {
+                if entry.is_expired(now) {
+                    continue;
+                }
+                if match_all || glob_match(pattern, key) {
+                    result.push(key.clone());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Incrementally iterate through keys in the database.
+    pub fn scan(
+        &self,
+        cursor: u64,
+        pattern: Option<&[u8]>,
+        count: usize,
+        type_filter: Option<&str>,
+    ) -> (u64, Vec<Bytes>) {
+        let now = Instant::now();
+        let num_shards = self.shared.num_shards;
+        let mut shard_idx = (cursor >> 32) as usize;
+        let mut offset = (cursor & 0xFFFF_FFFF) as usize;
+
+        if shard_idx >= num_shards {
+            return (0, Vec::new());
+        }
+
+        let mut matched = Vec::new();
+        let mut scanned = 0;
+        let target_scan = if count == 0 { 10 } else { count };
+
+        while shard_idx < num_shards && scanned < target_scan {
+            let shard = &self.shared.shards[shard_idx];
+            let entries = shard.entries.read();
+            let total = entries.len();
+
+            if offset >= total {
+                shard_idx += 1;
+                offset = 0;
+                continue;
+            }
+
+            for (key, entry) in entries.iter().skip(offset) {
+                offset += 1;
+                scanned += 1;
+
+                if entry.is_expired(now) {
+                    if scanned >= target_scan {
+                        break;
+                    }
+                    continue;
+                }
+
+                if let Some(tf) = type_filter {
+                    let type_matches = match &entry.data {
+                        DataType::String(_) => tf.eq_ignore_ascii_case("string"),
+                        DataType::List(_) => tf.eq_ignore_ascii_case("list"),
+                        DataType::Set(_) => tf.eq_ignore_ascii_case("set"),
+                        DataType::Hash(_) => tf.eq_ignore_ascii_case("hash"),
+                    };
+                    if !type_matches {
+                        if scanned >= target_scan {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                let is_match = match pattern {
+                    Some(b"*") | None => true,
+                    Some(p) => glob_match(p, key),
+                };
+
+                if is_match {
+                    matched.push(key.clone());
+                }
+
+                if scanned >= target_scan {
+                    break;
+                }
+            }
+
+            if offset >= total {
+                shard_idx += 1;
+                offset = 0;
+            }
+        }
+
+        let next_cursor = if shard_idx >= num_shards {
+            0
+        } else {
+            ((shard_idx as u64) << 32) | (offset as u64)
+        };
+
+        (next_cursor, matched)
+    }
     #[inline]
     fn add_memory(&self, bytes: usize) {
-        self.shared.current_memory.fetch_add(bytes, Ordering::Relaxed);
+        self.shared
+            .current_memory
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     #[inline]
     fn sub_memory(&self, bytes: usize) {
-        self.shared.current_memory.fetch_sub(bytes, Ordering::Relaxed);
+        self.shared
+            .current_memory
+            .fetch_sub(bytes, Ordering::Relaxed);
     }
+}
+
+/// Binary-safe glob pattern matching supporting '*', '?', '[...]', and '\\'.
+pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    let mut p = 0;
+    let mut t = 0;
+    let mut star_p = None;
+    let mut star_t = 0;
+
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            star_p = Some(p);
+            p += 1;
+            star_t = t;
+        } else if p < pattern.len() && pattern[p] == b'?' {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'[' {
+            p += 1;
+            let mut negate = false;
+            if p < pattern.len() && (pattern[p] == b'^' || pattern[p] == b'!') {
+                negate = true;
+                p += 1;
+            }
+            let mut matched = false;
+            let mut closed = false;
+            while p < pattern.len() {
+                if pattern[p] == b']' {
+                    closed = true;
+                    p += 1;
+                    break;
+                }
+                if p + 2 < pattern.len() && pattern[p + 1] == b'-' && pattern[p + 2] != b']' {
+                    let start = pattern[p];
+                    let end = pattern[p + 2];
+                    if text[t] >= start && text[t] <= end {
+                        matched = true;
+                    }
+                    p += 3;
+                } else {
+                    if pattern[p] == text[t] {
+                        matched = true;
+                    }
+                    p += 1;
+                }
+            }
+            if !closed {
+                matched = false;
+            }
+            if matched != negate {
+                t += 1;
+            } else if let Some(sp) = star_p {
+                p = sp + 1;
+                star_t += 1;
+                t = star_t;
+            } else {
+                return false;
+            }
+        } else if p < pattern.len() && pattern[p] == b'\\' {
+            p += 1;
+            if p < pattern.len() && pattern[p] == text[t] {
+                p += 1;
+                t += 1;
+            } else if let Some(sp) = star_p {
+                p = sp + 1;
+                star_t += 1;
+                t = star_t;
+            } else {
+                return false;
+            }
+        } else if p < pattern.len() && pattern[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some(sp) = star_p {
+            p = sp + 1;
+            star_t += 1;
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+
+    p == pattern.len()
 }
 
 impl Default for Db {
@@ -884,9 +1083,17 @@ impl Default for Db {
 fn parse_memory_limit(s: &str) -> Option<usize> {
     let s = s.trim().to_lowercase();
     if let Some(num_str) = s.strip_suffix("gb") {
-        num_str.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024 * 1024)
+        num_str
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n * 1024 * 1024 * 1024)
     } else if let Some(num_str) = s.strip_suffix("mb") {
-        num_str.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024)
+        num_str
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n * 1024 * 1024)
     } else if let Some(num_str) = s.strip_suffix("kb") {
         num_str.trim().parse::<usize>().ok().map(|n| n * 1024)
     } else {
@@ -904,7 +1111,12 @@ mod tests {
         let key = Bytes::from("mylist");
 
         // RPUSH mylist 1 2 3
-        let count = db.rpush(key.clone(), vec![Bytes::from("1"), Bytes::from("2"), Bytes::from("3")]).unwrap();
+        let count = db
+            .rpush(
+                key.clone(),
+                vec![Bytes::from("1"), Bytes::from("2"), Bytes::from("3")],
+            )
+            .unwrap();
         assert_eq!(count, 3);
 
         // LPUSH mylist 0
@@ -913,7 +1125,15 @@ mod tests {
 
         // LRANGE mylist 0 -1
         let range = db.lrange(key.as_ref(), 0, -1).unwrap();
-        assert_eq!(range, vec![Bytes::from("0"), Bytes::from("1"), Bytes::from("2"), Bytes::from("3")]);
+        assert_eq!(
+            range,
+            vec![
+                Bytes::from("0"),
+                Bytes::from("1"),
+                Bytes::from("2"),
+                Bytes::from("3")
+            ]
+        );
 
         // LPOP
         let popped = db.lpop(key.as_ref()).unwrap();
@@ -930,10 +1150,15 @@ mod tests {
         let key = Bytes::from("myhash");
 
         // HSET myhash f1 v1 f2 v2
-        let added = db.hset(key.clone(), vec![
-            (Bytes::from("f1"), Bytes::from("v1")),
-            (Bytes::from("f2"), Bytes::from("v2")),
-        ]).unwrap();
+        let added = db
+            .hset(
+                key.clone(),
+                vec![
+                    (Bytes::from("f1"), Bytes::from("v1")),
+                    (Bytes::from("f2"), Bytes::from("v2")),
+                ],
+            )
+            .unwrap();
         assert_eq!(added, 2);
 
         // HGET myhash f1
@@ -956,12 +1181,17 @@ mod tests {
         let key = Bytes::from("myset");
 
         // SADD myset a b c a
-        let added = db.sadd(key.clone(), vec![
-            Bytes::from("a"),
-            Bytes::from("b"),
-            Bytes::from("c"),
-            Bytes::from("a"),
-        ]).unwrap();
+        let added = db
+            .sadd(
+                key.clone(),
+                vec![
+                    Bytes::from("a"),
+                    Bytes::from("b"),
+                    Bytes::from("c"),
+                    Bytes::from("a"),
+                ],
+            )
+            .unwrap();
         assert_eq!(added, 3);
 
         // SISMEMBER
@@ -985,10 +1215,73 @@ mod tests {
         db.set(key.clone(), Bytes::from("value"), None);
 
         // Try list op on string
-        assert_eq!(db.lpush(key.clone(), vec![Bytes::from("1")]).unwrap_err(), WRONG_TYPE_ERR);
+        assert_eq!(
+            db.lpush(key.clone(), vec![Bytes::from("1")]).unwrap_err(),
+            WRONG_TYPE_ERR
+        );
         // Try hash op on string
         assert_eq!(db.hget(key.as_ref(), b"f").unwrap_err(), WRONG_TYPE_ERR);
         // Try set op on string
         assert_eq!(db.smembers(key.as_ref()).unwrap_err(), WRONG_TYPE_ERR);
+    }
+
+    #[test]
+    fn test_glob_match() {
+        use super::glob_match;
+        assert!(glob_match(b"*", b""));
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"h?llo", b"hello"));
+        assert!(!glob_match(b"h?llo", b"hllo"));
+        assert!(glob_match(b"h*o", b"hello"));
+        assert!(glob_match(b"h*o", b"ho"));
+        assert!(glob_match(b"user:*", b"user:100"));
+        assert!(!glob_match(b"user:*", b"profile:100"));
+        assert!(glob_match(b"h[ae]llo", b"hello"));
+        assert!(glob_match(b"h[ae]llo", b"hallo"));
+        assert!(!glob_match(b"h[ae]llo", b"hillo"));
+        assert!(glob_match(b"h[a-z]llo", b"hello"));
+        assert!(!glob_match(b"h[^e]llo", b"hello"));
+        assert!(glob_match(b"h[^e]llo", b"hallo"));
+        assert!(glob_match(b"foo\\*bar", b"foo*bar"));
+        assert!(!glob_match(b"foo\\*bar", b"foobar"));
+    }
+
+    #[test]
+    fn test_keys_and_scan() {
+        let db = Db::new();
+        db.set(Bytes::from("user:1"), Bytes::from("Alice"), None);
+        db.set(Bytes::from("user:2"), Bytes::from("Bob"), None);
+        db.set(Bytes::from("admin:1"), Bytes::from("Super"), None);
+
+        // KEYS *
+        let all_keys = db.keys(b"*");
+        assert_eq!(all_keys.len(), 3);
+
+        // KEYS user:*
+        let user_keys = db.keys(b"user:*");
+        assert_eq!(user_keys.len(), 2);
+
+        // KEYS admin:*
+        let admin_keys = db.keys(b"admin:*");
+        assert_eq!(admin_keys.len(), 1);
+        assert_eq!(admin_keys[0], Bytes::from("admin:1"));
+
+        // SCAN
+        let (mut cur, mut collected) = db.scan(0, None, 10, None);
+        while cur != 0 {
+            let (next_cur, items) = db.scan(cur, None, 10, None);
+            collected.extend(items);
+            cur = next_cur;
+        }
+        assert_eq!(collected.len(), 3);
+
+        // SCAN with MATCH
+        let (mut cur, mut collected_users) = db.scan(0, Some(b"user:*"), 10, None);
+        while cur != 0 {
+            let (next_cur, items) = db.scan(cur, Some(b"user:*"), 10, None);
+            collected_users.extend(items);
+            cur = next_cur;
+        }
+        assert_eq!(collected_users.len(), 2);
     }
 }
