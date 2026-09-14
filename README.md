@@ -50,6 +50,14 @@ This project implements a lightweight yet fully-featured, production-ready in-me
   - **Graceful Shutdown:** Catches `SIGINT` (Ctrl+C) and `SIGTERM`, notifies active clients, cleanly closes background tasks, and syncs AOF state.
   - **Jemalloc Integration:** Configured with `tikv-jemallocator` to prevent external heap fragmentation under heavy write/delete workloads.
 
+- **📊 Real-Time Metrics & Web Dashboard:**
+  - **Embedded Web UI (`http://localhost:8080`):** Real-time responsive dark-mode dashboard with animated canvas charts and live metrics streaming via Server-Sent Events (SSE).
+  - **Highlighted Hero Metric:** **Cache Hit Ratio (%)** & Cache Miss Ratio (%) with radial gauge and historical trends.
+  - **Comprehensive Resource Tracking:** Cache Memory, Process RSS (`/proc/self/statm`), Process CPU (`/proc/self/stat`), Active & Peak Clients, Throughput (Commands/sec), Evicted Keys (LRU), Expired Keys (TTL), Latency distribution (Avg, P50, P95, P99), and Connection Errors.
+  - **REST API (`/api/metrics`):** JSON metrics endpoint for custom scrapers and external dashboards.
+  - **Redis `INFO` Command:** Full compatibility with Prometheus `redis_exporter` and `redis-cli INFO`.
+  - **Traffic Simulator (`/api/simulate`):** Built-in traffic generation for live cache hit/miss evaluation.
+
 ---
 
 ## 🏗️ Architecture

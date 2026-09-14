@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use in_memory_cache::cmd::PubSubCmd;
-use in_memory_cache::{Aof, Command, Connection, Db, Frame, PubSub, Result};
+use in_memory_cache::{Aof, Command, Connection, Db, Frame, Metrics, PubSub, Result};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +38,8 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("appendonly.aof"));
 
-    let db = Db::new();
+    let metrics = Arc::new(Metrics::new());
+    let db = Db::with_metrics(metrics.clone());
 
     // Rehydrate database from AOF if file exists
     if let Err(e) = Aof::load(&aof_path, &db).await {
@@ -53,6 +54,41 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("🚀 In-Memory-Cache server listening on {}", bind_addr);
     info!("⚙️  Max concurrent connections: {}", max_connections);
+
+    // Embedded Web Dashboard & REST/SSE Server
+    let web_port = std::env::var("WEB_PORT")
+        .or_else(|_| std::env::var("DASHBOARD_PORT"))
+        .unwrap_or_else(|_| "8080".to_string());
+    let web_bind_addr: SocketAddr = format!("0.0.0.0:{}", web_port)
+        .parse()
+        .unwrap_or(([0, 0, 0, 0], 8080).into());
+    let web_db = db.clone();
+    let web_metrics = metrics.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            in_memory_cache::web::start_web_server(web_bind_addr, web_db, web_metrics).await
+        {
+            error!("Web dashboard server error: {}", e);
+        }
+    });
+
+    // 1-second system & throughput metrics background sampler
+    let sampler_db = db.clone();
+    let sampler_metrics = metrics.clone();
+    let mut sampler_shutdown = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    sampler_metrics.tick_second(sampler_db.current_memory());
+                }
+                _ = sampler_shutdown.recv() => {
+                    break;
+                }
+            }
+        }
+    });
 
     // Active sweeper background task with shutdown awareness
     let sweeper_db = db.clone();
@@ -90,20 +126,24 @@ async fn main() -> Result<()> {
                         let permit = match conn_limiter.clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
+                                metrics.record_connection_error();
                                 warn!("Connection limit reached ({}), rejecting {}", max_connections, peer_addr);
                                 continue;
                             }
                         };
 
+                        metrics.client_connected();
                         let db = db.clone();
                         let aof = aof.clone();
                         let pubsub = pubsub.clone();
+                        let conn_metrics = metrics.clone();
                         let mut shutdown_rx = shutdown_tx.subscribe();
 
                         tokio::spawn(async move {
                             tokio::select! {
-                                res = process_connection(socket, peer_addr, db, aof, pubsub) => {
+                                res = process_connection(socket, peer_addr, db, aof, pubsub, conn_metrics.clone()) => {
                                     if let Err(err) = res {
+                                        conn_metrics.record_connection_error();
                                         error!("Connection error with {}: {}", peer_addr, err);
                                     }
                                 }
@@ -111,10 +151,12 @@ async fn main() -> Result<()> {
                                     info!("Closing connection {} due to server shutdown", peer_addr);
                                 }
                             }
+                            conn_metrics.client_disconnected();
                             drop(permit);
                         });
                     }
                     Err(err) => {
+                        metrics.record_connection_error();
                         error!("Failed to accept incoming connection: {}", err);
                     }
                 }
@@ -169,6 +211,7 @@ async fn process_connection(
     db: Db,
     aof: Arc<Aof>,
     pubsub: Arc<PubSub>,
+    metrics: Arc<Metrics>,
 ) -> Result<()> {
     info!("New connection established from {}", peer_addr);
     let mut connection = Connection::new(socket);
@@ -177,14 +220,17 @@ async fn process_connection(
         let cmd = match Command::from_frame(frame.clone()) {
             Ok(cmd) => cmd,
             Err(err) => {
-                connection.write_frame(&Frame::Error(err.to_string())).await?;
+                metrics.record_connection_error();
+                connection
+                    .write_frame(&Frame::Error(err.to_string()))
+                    .await?;
                 continue;
             }
         };
 
         // If client sends SUBSCRIBE, enter pub/sub subscriber mode
         if let Command::PubSub(PubSubCmd::Subscribe { channels }) = cmd {
-            return run_subscriber_mode(connection, channels, pubsub, peer_addr).await;
+            return run_subscriber_mode(connection, channels, pubsub, peer_addr, metrics).await;
         }
 
         // Check if command modifies state; if so, persist to AOF
@@ -192,7 +238,10 @@ async fn process_connection(
             aof.record(&frame).await;
         }
 
+        let cmd_start = std::time::Instant::now();
         let response = cmd.apply_with_pubsub(&db, &pubsub);
+        let duration_us = cmd_start.elapsed().as_micros() as u64;
+        metrics.record_command(duration_us);
 
         // Pipelining optimization: buffer writes and only flush when socket input is exhausted
         connection.write_frame_buffered(&response).await?;
@@ -212,6 +261,7 @@ async fn run_subscriber_mode(
     initial_channels: Vec<String>,
     pubsub: Arc<PubSub>,
     peer_addr: SocketAddr,
+    metrics: Arc<Metrics>,
 ) -> Result<()> {
     let mut subscriptions = StreamMap::new();
 
@@ -248,6 +298,7 @@ async fn run_subscriber_mode(
                     Some(frame) => {
                         match Command::from_frame(frame) {
                             Ok(Command::PubSub(PubSubCmd::Subscribe { channels })) => {
+                                metrics.record_command(5);
                                 for ch in channels {
                                     if !subscriptions.contains_key(&ch) {
                                         let rx = pubsub.subscribe(&ch);
@@ -263,6 +314,7 @@ async fn run_subscriber_mode(
                                 }
                             }
                             Ok(Command::Ping(_)) => {
+                                metrics.record_command(2);
                                 let pong = Frame::Array(vec![
                                     Frame::Bulk(Bytes::from_static(b"pong")),
                                     Frame::Bulk(Bytes::from_static(b"")),
@@ -270,6 +322,7 @@ async fn run_subscriber_mode(
                                 connection.write_frame(&pong).await?;
                             }
                             _ => {
+                                metrics.record_connection_error();
                                 connection.write_frame(&Frame::Error("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context".into())).await?;
                             }
                         }

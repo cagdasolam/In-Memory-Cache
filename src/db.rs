@@ -69,6 +69,7 @@ struct Shared {
     maxmemory: usize, // 0 = unlimited
     current_memory: AtomicUsize,
     start_time: Instant,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 /// High-performance sharded in-memory database with multi-types, TTL, and approximated LRU.
@@ -85,11 +86,38 @@ impl Db {
             .and_then(|v| parse_memory_limit(&v))
             .unwrap_or(0);
 
-        Self::with_options(DEFAULT_NUM_SHARDS, maxmemory)
+        Self::with_options_and_metrics(
+            DEFAULT_NUM_SHARDS,
+            maxmemory,
+            Arc::new(crate::metrics::Metrics::new()),
+        )
     }
 
     /// Create a database instance with specific sharding and memory limit.
     pub fn with_options(num_shards: usize, maxmemory: usize) -> Db {
+        Self::with_options_and_metrics(
+            num_shards,
+            maxmemory,
+            Arc::new(crate::metrics::Metrics::new()),
+        )
+    }
+
+    /// Create a database instance with shared metrics engine.
+    pub fn with_metrics(metrics: Arc<crate::metrics::Metrics>) -> Db {
+        let maxmemory = std::env::var("MAXMEMORY")
+            .ok()
+            .and_then(|v| parse_memory_limit(&v))
+            .unwrap_or(0);
+
+        Self::with_options_and_metrics(DEFAULT_NUM_SHARDS, maxmemory, metrics)
+    }
+
+    /// Create a database instance with sharding, memory limit and shared metrics engine.
+    pub fn with_options_and_metrics(
+        num_shards: usize,
+        maxmemory: usize,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Db {
         let mut shards = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
             shards.push(Shard {
@@ -104,8 +132,17 @@ impl Db {
                 maxmemory,
                 current_memory: AtomicUsize::new(0),
                 start_time: Instant::now(),
+                metrics,
             }),
         }
+    }
+
+    pub fn metrics(&self) -> &Arc<crate::metrics::Metrics> {
+        &self.shared.metrics
+    }
+
+    pub fn maxmemory(&self) -> usize {
+        self.shared.maxmemory
     }
 
     #[inline]
@@ -155,12 +192,14 @@ impl Db {
                     entry
                         .last_accessed
                         .store(self.now_millis(), Ordering::Relaxed);
+                    self.shared.metrics.record_hit();
                     return match &entry.data {
                         DataType::String(b) => Ok(Some(b.clone())),
                         _ => Err(WRONG_TYPE_ERR.to_string()),
                     };
                 }
             } else {
+                self.shared.metrics.record_miss();
                 return Ok(None);
             }
         }
@@ -172,11 +211,14 @@ impl Db {
                 let size = entry.size_bytes(key);
                 entries.remove(key);
                 self.sub_memory(size);
+                self.shared.metrics.record_expiration(1);
+                self.shared.metrics.record_miss();
                 return Ok(None);
             } else {
                 entry
                     .last_accessed
                     .store(self.now_millis(), Ordering::Relaxed);
+                self.shared.metrics.record_hit();
                 return match &entry.data {
                     DataType::String(b) => Ok(Some(b.clone())),
                     _ => Err(WRONG_TYPE_ERR.to_string()),
@@ -184,6 +226,7 @@ impl Db {
             }
         }
 
+        self.shared.metrics.record_miss();
         Ok(None)
     }
 
@@ -294,6 +337,8 @@ impl Db {
                 let size = entry.size_bytes(key);
                 entries.remove(key);
                 self.sub_memory(size);
+                self.shared.metrics.record_expiration(1);
+                self.shared.metrics.record_miss();
                 return Ok(None);
             }
 
@@ -302,6 +347,9 @@ impl Db {
                     let popped = list.pop_front();
                     if let Some(ref p) = popped {
                         self.sub_memory(p.len() + 16);
+                        self.shared.metrics.record_hit();
+                    } else {
+                        self.shared.metrics.record_miss();
                     }
                     if list.is_empty() {
                         let size = entry.size_bytes(key);
@@ -317,6 +365,7 @@ impl Db {
                 _ => Err(WRONG_TYPE_ERR.to_string()),
             }
         } else {
+            self.shared.metrics.record_miss();
             Ok(None)
         }
     }
@@ -332,6 +381,8 @@ impl Db {
                 let size = entry.size_bytes(key);
                 entries.remove(key);
                 self.sub_memory(size);
+                self.shared.metrics.record_expiration(1);
+                self.shared.metrics.record_miss();
                 return Ok(None);
             }
 
@@ -340,6 +391,9 @@ impl Db {
                     let popped = list.pop_back();
                     if let Some(ref p) = popped {
                         self.sub_memory(p.len() + 16);
+                        self.shared.metrics.record_hit();
+                    } else {
+                        self.shared.metrics.record_miss();
                     }
                     if list.is_empty() {
                         let size = entry.size_bytes(key);
@@ -355,6 +409,7 @@ impl Db {
                 _ => Err(WRONG_TYPE_ERR.to_string()),
             }
         } else {
+            self.shared.metrics.record_miss();
             Ok(None)
         }
     }
@@ -367,6 +422,7 @@ impl Db {
         let entries = shard.entries.read();
         if let Some(entry) = entries.get(key) {
             if entry.is_expired(now) {
+                self.shared.metrics.record_miss();
                 return Ok(Vec::new());
             }
 
@@ -375,6 +431,7 @@ impl Db {
                     entry
                         .last_accessed
                         .store(self.now_millis(), Ordering::Relaxed);
+                    self.shared.metrics.record_hit();
                     let len = list.len() as i64;
                     if len == 0 {
                         return Ok(Vec::new());
@@ -403,6 +460,7 @@ impl Db {
                 _ => Err(WRONG_TYPE_ERR.to_string()),
             }
         } else {
+            self.shared.metrics.record_miss();
             Ok(Vec::new())
         }
     }
@@ -462,6 +520,7 @@ impl Db {
         let entries = shard.entries.read();
         if let Some(entry) = entries.get(key) {
             if entry.is_expired(now) {
+                self.shared.metrics.record_miss();
                 return Ok(None);
             }
 
@@ -470,11 +529,18 @@ impl Db {
                     entry
                         .last_accessed
                         .store(self.now_millis(), Ordering::Relaxed);
-                    Ok(map.get(field).cloned())
+                    if let Some(val) = map.get(field).cloned() {
+                        self.shared.metrics.record_hit();
+                        Ok(Some(val))
+                    } else {
+                        self.shared.metrics.record_miss();
+                        Ok(None)
+                    }
                 }
                 _ => Err(WRONG_TYPE_ERR.to_string()),
             }
         } else {
+            self.shared.metrics.record_miss();
             Ok(None)
         }
     }
@@ -528,6 +594,7 @@ impl Db {
         let entries = shard.entries.read();
         if let Some(entry) = entries.get(key) {
             if entry.is_expired(now) {
+                self.shared.metrics.record_miss();
                 return Ok(Vec::new());
             }
 
@@ -536,12 +603,14 @@ impl Db {
                     entry
                         .last_accessed
                         .store(self.now_millis(), Ordering::Relaxed);
+                    self.shared.metrics.record_hit();
                     let pairs = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                     Ok(pairs)
                 }
                 _ => Err(WRONG_TYPE_ERR.to_string()),
             }
         } else {
+            self.shared.metrics.record_miss();
             Ok(Vec::new())
         }
     }
@@ -594,6 +663,7 @@ impl Db {
         let entries = shard.entries.read();
         if let Some(entry) = entries.get(key) {
             if entry.is_expired(now) {
+                self.shared.metrics.record_miss();
                 return Ok(Vec::new());
             }
 
@@ -602,11 +672,13 @@ impl Db {
                     entry
                         .last_accessed
                         .store(self.now_millis(), Ordering::Relaxed);
+                    self.shared.metrics.record_hit();
                     Ok(set.iter().cloned().collect())
                 }
                 _ => Err(WRONG_TYPE_ERR.to_string()),
             }
         } else {
+            self.shared.metrics.record_miss();
             Ok(Vec::new())
         }
     }
@@ -660,6 +732,7 @@ impl Db {
         let entries = shard.entries.read();
         if let Some(entry) = entries.get(key) {
             if entry.is_expired(now) {
+                self.shared.metrics.record_miss();
                 return Ok(false);
             }
 
@@ -668,11 +741,18 @@ impl Db {
                     entry
                         .last_accessed
                         .store(self.now_millis(), Ordering::Relaxed);
-                    Ok(set.contains(member))
+                    let found = set.contains(member);
+                    if found {
+                        self.shared.metrics.record_hit();
+                    } else {
+                        self.shared.metrics.record_miss();
+                    }
+                    Ok(found)
                 }
                 _ => Err(WRONG_TYPE_ERR.to_string()),
             }
         } else {
+            self.shared.metrics.record_miss();
             Ok(false)
         }
     }
@@ -794,14 +874,19 @@ impl Db {
 
         if !expired_keys.is_empty() {
             let mut entries = shard.entries.write();
+            let mut actually_removed = 0;
             for key in &expired_keys {
                 if let Some(entry) = entries.get(key) {
                     if entry.is_expired(now) {
                         let size = entry.size_bytes(key);
                         entries.remove(key);
                         self.sub_memory(size);
+                        actually_removed += 1;
                     }
                 }
+            }
+            if actually_removed > 0 {
+                self.shared.metrics.record_expiration(actually_removed);
             }
         }
 
@@ -840,6 +925,7 @@ impl Db {
             let mut entries = shard.entries.write();
             if let Some(entry) = entries.remove(&key_to_evict) {
                 self.sub_memory(entry.size_bytes(&key_to_evict));
+                self.shared.metrics.record_eviction(1);
                 return true;
             }
         }

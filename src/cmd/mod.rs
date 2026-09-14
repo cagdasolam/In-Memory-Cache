@@ -151,9 +151,12 @@ impl Command {
             Command::Keys(keys) => keys.apply(db),
             Command::Scan(scan) => scan.apply(db),
             Command::Command => Frame::Array(vec![]),
-            Command::Info => Frame::Bulk(bytes::Bytes::from_static(
-                b"# Server\r\nredis_version:7.0.0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\nrole:master\r\nloading:0\r\n",
-            )),
+            Command::Info => {
+                let info_str =
+                    db.metrics()
+                        .format_redis_info(db.current_memory(), db.len(), db.maxmemory());
+                Frame::Bulk(bytes::Bytes::from(info_str))
+            }
             Command::Client => Frame::Simple("OK".into()),
         }
     }
